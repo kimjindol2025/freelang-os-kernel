@@ -1,0 +1,16 @@
+[package]
+name = "freelang-os"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[[bin]]
+name = "boot"
+path = "src/bootloader.rs"
+
+[[bin]]
+name = "kernel"
+path = "src/kernel.rs"
