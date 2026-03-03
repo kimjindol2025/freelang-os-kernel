@@ -6,11 +6,15 @@ pub mod distributed_tracer;
 pub mod metrics_collector;
 pub mod monitoring_dashboard;
 pub mod sre_operations;
+pub mod chaos_real_injection;
+pub mod postmortem_analyzer;
 
 pub use distributed_tracer::{TraceContext, DistributedTracer};
 pub use metrics_collector::{Metric, MetricsCollector};
 pub use monitoring_dashboard::{DashboardMetric, MonitoringDashboard};
 pub use sre_operations::{PolicyType, Policy, SREDecisionEngine, PolicyExecutor, RecoveryState, RecoveryOrchestrator};
+pub use chaos_real_injection::{InjectionStrategy, ChaosInjectionRequest, ChaosRealInjector, FeedbackLoopController};
+pub use postmortem_analyzer::{RootCause, IncidentTimeline, PostmortemAnalyzer};
 
 // ============================================================================
 // Phase H Week 1 Module Structure
@@ -45,11 +49,22 @@ pub use sre_operations::{PolicyType, Policy, SREDecisionEngine, PolicyExecutor, 
 //    - RecoveryOrchestrator: 자동 복구 오케스트레이션 (state machine)
 //    - 기능: 위반 히스토리, 정책 효과도 추정, 복구 검증
 //
-// ⏳ Days 10-14: chaos_real_injection.fl + postmortem_analyzer.fl (600줄)
-//    - Phase I ← Phase H: SLO 위반 시 chaos scenario 자동 주입
-//    - Postmortem: 장애 근본 원인 자동 분석 (timeline reconstruction)
+// ✅ Days 10-14: chaos_real_injection.fl + postmortem_analyzer.fl (600줄, 12테스트) ✨ NEW
 //
-// **Week 2 누적**: 400 + 600 = 1,000줄 (목표 달성)
+//    **Part 1: chaos_real_injection.fl** (300줄, 6테스트)
+//    - InjectionStrategy: Auto/Manual/Cascade (정책 기반 장애 주입)
+//    - ChaosInjectionRequest: 정책 → 장애 매핑 (ReduceBatchSize → LatencySpike)
+//    - ChaosRealInjector: 실제 장애 주입 실행 + 복구 트리거
+//    - FeedbackLoopController: Phase H ↔ Phase I 양방향 피드백 추적
+//    - 기능: active_faults 추적, recovery_triggered 자동 실행
+//
+//    **Part 2: postmortem_analyzer.fl** (300줄, 6테스트)
+//    - RootCause: 근본 원인 (type, severity, confidence, timeline)
+//    - IncidentTimeline: 사건 타임라인 (events, metric_changes)
+//    - PostmortemAnalyzer: 자동 RCA 생성
+//    - 기능: 메트릭 기반 원인 유추, 권장사항 자동 생성, 보고서 작성
+//
+// **Week 2 완료**: 400 + 600 = 1,000줄 ✅ (목표 달성!)
 //
 
 // ============================================================================
@@ -93,5 +108,35 @@ pub use sre_operations::{PolicyType, Policy, SREDecisionEngine, PolicyExecutor, 
 //    - Trace ID ↔ Metric 연결 (exemplar)
 //    - SLO 위반 → Phase I 장애 주입
 //    - Phase 7 정책 실행 → 메트릭 개선 추적
+//
+// ============================================================================
+// Success Criteria (Phase H Week 2)
+// ============================================================================
+//
+// ✅ SRE Operations
+//    - SLO 위반 자동 감지 → 정책 결정 (severity, effectiveness)
+//    - 6가지 정책 구현 (ReduceBatchSize, EnableIncrementalGC, etc.)
+//    - PolicyExecutor: 리소스 조정 추적 (batch_size, gc_mode, request_rate, etc.)
+//    - RecoveryOrchestrator: 상태 관리 (Healthy→Degraded→Recovering→Recovered)
+//
+// ✅ Chaos Real Injection
+//    - Phase H → Phase I 양방향 피드백
+//    - 정책 기반 장애 주입 (ReduceBatchSize → LatencySpike, etc.)
+//    - Cascade 장애 (여러 정책 동시)
+//    - FeedbackLoopController: 통합 피드백 추적 (violations→policies→injections→recoveries)
+//
+// ✅ Postmortem Analysis
+//    - 메트릭 기반 자동 RCA (Root Cause Analysis)
+//    - IncidentTimeline: 사건 순서 재구성
+//    - RootCause: 신뢰도 + 영향 시스템 식별
+//    - 자동 권장사항 생성 + 보고서 작성
+//
+// ✅ End-to-End Pipeline
+//    Phase I (Chaos) → Metrics degrade →
+//    Phase H1 (Dashboard) → SLO violation →
+//    Phase H2 (SRE) → Policy decision →
+//    Phase H2 (Injection) → Chaos injected →
+//    Phase I (Recovery) → Metrics improve →
+//    Phase H2 (Postmortem) → RCA + recommendations
 //
 

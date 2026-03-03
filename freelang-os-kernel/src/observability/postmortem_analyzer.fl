@@ -1,0 +1,376 @@
+// FreeLang Phase H Week 2: Postmortem Analyzer
+// Days 12-14 Part 2: 자동 근본 원인 분석 (RCA) (300줄, 6테스트)
+// Phase I + Phase H 통합 데이터로부터 자동 RCA 생성
+
+use std::collections::HashMap;
+
+// ============================================================================
+// ROOT CAUSE: 근본 원인
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct RootCause {
+    pub cause_type: String,              // "latency_spike", "memory_leak", etc.
+    pub severity: u32,                   // 1-5: 심각도
+    pub confidence: f64,                 // 0.0-1.0: 신뢰도
+    pub affected_systems: Vec<String>,   // "cpu", "memory", "io", etc.
+    pub timeline: Vec<(u64, String)>,   // (시간, 사건)
+}
+
+impl RootCause {
+    pub fn new(cause_type: String, severity: u32) -> Self {
+        RootCause {
+            cause_type,
+            severity,
+            confidence: 0.0,
+            affected_systems: Vec::new(),
+            timeline: Vec::new(),
+        }
+    }
+
+    pub fn add_affected_system(&mut self, system: String) {
+        self.affected_systems.push(system);
+    }
+
+    pub fn add_timeline_event(&mut self, timestamp_us: u64, event: String) {
+        self.timeline.push((timestamp_us, event));
+    }
+
+    pub fn set_confidence(&mut self, confidence: f64) {
+        self.confidence = confidence.min(1.0).max(0.0);
+    }
+
+    pub fn to_summary(&self) -> String {
+        format!(
+            "RootCause: {} (severity: {}, confidence: {:.0}%) - Affected: {}",
+            self.cause_type, self.severity,
+            self.confidence * 100.0,
+            self.affected_systems.join(", ")
+        )
+    }
+}
+
+// ============================================================================
+// INCIDENT TIMELINE: 사건 타임라인
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct IncidentTimeline {
+    pub start_time_us: u64,
+    pub end_time_us: u64,
+    pub events: Vec<(u64, String)>,      // 시간순 이벤트
+    pub metric_changes: HashMap<String, (f64, f64)>,  // (before, after)
+}
+
+impl IncidentTimeline {
+    pub fn new(start_time_us: u64) -> Self {
+        IncidentTimeline {
+            start_time_us,
+            end_time_us: start_time_us,
+            events: Vec::new(),
+            metric_changes: HashMap::new(),
+        }
+    }
+
+    pub fn add_event(&mut self, timestamp_us: u64, description: String) {
+        self.events.push((timestamp_us, description));
+        if timestamp_us > self.end_time_us {
+            self.end_time_us = timestamp_us;
+        }
+    }
+
+    pub fn record_metric_change(&mut self, metric: String, before: f64, after: f64) {
+        self.metric_changes.insert(metric, (before, after));
+    }
+
+    pub fn get_duration_ms(&self) -> u64 {
+        (self.end_time_us - self.start_time_us) / 1000
+    }
+
+    pub fn get_event_count(&self) -> usize {
+        self.events.len()
+    }
+}
+
+// ============================================================================
+// POSTMORTEM ANALYZER: 자동 RCA 생성
+// ============================================================================
+
+pub struct PostmortemAnalyzer {
+    pub analyses_performed: u32,
+    pub root_causes: Vec<RootCause>,
+    pub recommendations: Vec<String>,
+}
+
+impl PostmortemAnalyzer {
+    pub fn new() -> Self {
+        PostmortemAnalyzer {
+            analyses_performed: 0,
+            root_causes: Vec::new(),
+            recommendations: Vec::new(),
+        }
+    }
+
+    pub fn analyze_incident(&mut self, timeline: &IncidentTimeline) -> Option<RootCause> {
+        if timeline.events.is_empty() {
+            return None;
+        }
+
+        self.analyses_performed += 1;
+
+        // 메트릭 변화를 기반으로 근본 원인 식별
+        let mut root_cause = None;
+        let mut max_degradation = 0.0;
+        let mut degraded_metric = String::new();
+
+        for (metric, (before, after)) in &timeline.metric_changes {
+            let degradation = (after - before).abs();
+            if degradation > max_degradation {
+                max_degradation = degradation;
+                degraded_metric = metric.clone();
+                
+                // 메트릭별 근본 원인 유추
+                root_cause = Some(self.infer_root_cause(&degraded_metric, *before, *after));
+            }
+        }
+
+        if let Some(mut cause) = root_cause {
+            cause.set_confidence(0.8);  // 기본 신뢰도
+            
+            // 타임라인 사건 추가
+            for (ts, event) in &timeline.events {
+                cause.add_timeline_event(*ts, event.clone());
+            }
+            
+            // 영향받은 시스템 식별
+            cause.add_affected_system(degraded_metric.clone());
+            
+            self.root_causes.push(cause.clone());
+            
+            // 권장사항 생성
+            self.generate_recommendations(&cause);
+            
+            Some(cause)
+        } else {
+            None
+        }
+    }
+
+    fn infer_root_cause(&self, metric: &str, before: f64, after: f64) -> RootCause {
+        match metric {
+            "p99.latency" => {
+                let mut cause = RootCause::new("LatencySpike".to_string(), 4);
+                cause.add_affected_system("cpu".to_string());
+                cause.add_affected_system("scheduler".to_string());
+                cause
+            }
+            "gc.pause" => {
+                let mut cause = RootCause::new("MemoryPressure".to_string(), 3);
+                cause.add_affected_system("memory".to_string());
+                cause.add_affected_system("gc".to_string());
+                cause
+            }
+            "io.latency" => {
+                let mut cause = RootCause::new("IObottleneck".to_string(), 3);
+                cause.add_affected_system("disk".to_string());
+                cause.add_affected_system("io".to_string());
+                cause
+            }
+            "cpu.utilization" => {
+                let mut cause = RootCause::new("CPUOverload".to_string(), 4);
+                cause.add_affected_system("cpu".to_string());
+                cause.add_affected_system("scheduler".to_string());
+                cause
+            }
+            _ => {
+                RootCause::new("UnknownCause".to_string(), 2)
+            }
+        }
+    }
+
+    fn generate_recommendations(&mut self, cause: &RootCause) {
+        match cause.cause_type.as_str() {
+            "LatencySpike" => {
+                self.recommendations.push(
+                    "1. Reduce batch size to improve tail latency".to_string()
+                );
+                self.recommendations.push(
+                    "2. Profile CPU hotspots during spike".to_string()
+                );
+                self.recommendations.push(
+                    "3. Consider request coalescing".to_string()
+                );
+            }
+            "MemoryPressure" => {
+                self.recommendations.push(
+                    "1. Enable incremental GC".to_string()
+                );
+                self.recommendations.push(
+                    "2. Increase heap size temporarily".to_string()
+                );
+                self.recommendations.push(
+                    "3. Profile memory allocations".to_string()
+                );
+            }
+            "IObottleneck" => {
+                self.recommendations.push(
+                    "1. Enable I/O queue prioritization".to_string()
+                );
+                self.recommendations.push(
+                    "2. Increase disk throughput capacity".to_string()
+                );
+                self.recommendations.push(
+                    "3. Consider caching strategy".to_string()
+                );
+            }
+            "CPUOverload" => {
+                self.recommendations.push(
+                    "1. Throttle incoming requests".to_string()
+                );
+                self.recommendations.push(
+                    "2. Distribute load to other nodes".to_string()
+                );
+                self.recommendations.push(
+                    "3. Scale horizontally".to_string()
+                );
+            }
+            _ => {
+                self.recommendations.push(
+                    "1. Investigate further with detailed logs".to_string()
+                );
+            }
+        }
+    }
+
+    pub fn get_root_cause_count(&self) -> usize {
+        self.root_causes.len()
+    }
+
+    pub fn get_recommendations(&self) -> Vec<String> {
+        self.recommendations.clone()
+    }
+
+    pub fn generate_postmortem_report(&self) -> String {
+        let mut report = format!(
+            "POSTMORTEM REPORT\n\
+             ═════════════════════════════════════════\n\
+             Analyses Performed: {}\n\
+             Root Causes Found: {}\n\n",
+            self.analyses_performed, self.root_causes.len()
+        );
+
+        for (i, cause) in self.root_causes.iter().enumerate() {
+            report.push_str(&format!(
+                "Cause #{}: {}\n\
+                 Severity: {}/5\n\
+                 Confidence: {:.0}%\n\
+                 Affected Systems: {}\n\
+                 Events: {}\n\n",
+                i + 1,
+                cause.cause_type,
+                cause.severity,
+                cause.confidence * 100.0,
+                cause.affected_systems.join(", "),
+                cause.timeline.len()
+            ));
+        }
+
+        if !self.recommendations.is_empty() {
+            report.push_str("RECOMMENDATIONS:\n");
+            for rec in &self.recommendations {
+                report.push_str(&format!("  - {}\n", rec));
+            }
+        }
+
+        report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_cause_creation() {
+        let cause = RootCause::new("LatencySpike".to_string(), 4);
+        assert_eq!(cause.cause_type, "LatencySpike");
+        assert_eq!(cause.severity, 4);
+        assert_eq!(cause.confidence, 0.0);
+    }
+
+    #[test]
+    fn test_incident_timeline() {
+        let mut timeline = IncidentTimeline::new(0);
+        timeline.add_event(100_000, "Fault injected".to_string());
+        timeline.add_event(500_000, "Metrics degraded".to_string());
+        timeline.add_event(1_000_000, "Recovery started".to_string());
+        
+        assert_eq!(timeline.get_event_count(), 3);
+        assert_eq!(timeline.get_duration_ms(), 1000);
+    }
+
+    #[test]
+    fn test_metric_change_recording() {
+        let mut timeline = IncidentTimeline::new(0);
+        timeline.record_metric_change("p99.latency".to_string(), 10.0, 150.0);
+        timeline.record_metric_change("gc.pause".to_string(), 20.0, 60.0);
+        
+        assert_eq!(timeline.metric_changes.len(), 2);
+        assert_eq!(timeline.metric_changes["p99.latency"], (10.0, 150.0));
+    }
+
+    #[test]
+    fn test_analyze_latency_incident() {
+        let mut analyzer = PostmortemAnalyzer::new();
+        let mut timeline = IncidentTimeline::new(0);
+        timeline.record_metric_change("p99.latency".to_string(), 10.0, 150.0);
+        timeline.add_event(100_000, "LatencySpike injected".to_string());
+        
+        let cause = analyzer.analyze_incident(&timeline);
+        
+        assert!(cause.is_some());
+        let c = cause.unwrap();
+        assert_eq!(c.cause_type, "LatencySpike");
+        assert_eq!(c.severity, 4);
+        assert!(c.confidence > 0.0);
+    }
+
+    #[test]
+    fn test_analyze_memory_incident() {
+        let mut analyzer = PostmortemAnalyzer::new();
+        let mut timeline = IncidentTimeline::new(0);
+        timeline.record_metric_change("gc.pause".to_string(), 20.0, 200.0);
+        timeline.add_event(100_000, "MemoryLeak injected".to_string());
+        
+        let cause = analyzer.analyze_incident(&timeline);
+        
+        assert!(cause.is_some());
+        let c = cause.unwrap();
+        assert_eq!(c.cause_type, "MemoryPressure");
+    }
+
+    #[test]
+    fn test_postmortem_report_generation() {
+        let mut analyzer = PostmortemAnalyzer::new();
+        let mut timeline = IncidentTimeline::new(0);
+        timeline.record_metric_change("p99.latency".to_string(), 10.0, 150.0);
+        timeline.add_event(100_000, "Fault injected".to_string());
+        
+        analyzer.analyze_incident(&timeline);
+        
+        let report = analyzer.generate_postmortem_report();
+        assert!(report.contains("POSTMORTEM REPORT"));
+        assert!(report.contains("Root Causes Found: 1"));
+        assert!(report.contains("RECOMMENDATIONS:"));
+    }
+
+    #[test]
+    fn test_recommendations_generation() {
+        let mut analyzer = PostmortemAnalyzer::new();
+        let mut cause = RootCause::new("LatencySpike".to_string(), 4);
+        analyzer.generate_recommendations(&cause);
+        
+        assert!(!analyzer.get_recommendations().is_empty());
+        assert!(analyzer.get_recommendations()[0].contains("Reduce batch size"));
+    }
+}

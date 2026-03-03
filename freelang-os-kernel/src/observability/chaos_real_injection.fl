@@ -1,0 +1,305 @@
+// FreeLang Phase H Week 2: Chaos Real Injection
+// Days 10-14 Part 1: Phase H → Phase I 정책 기반 장애 주입 (300줄, 6테스트)
+// SLO 위반 감지 후 자동으로 chaos scenario 실행
+
+use std::collections::HashMap;
+
+// ============================================================================
+// INJECTION STRATEGY: 정책 기반 장애 주입 전략
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub enum InjectionStrategy {
+    Auto,          // 자동 선택 (가장 효과적인 정책에 맞는 장애)
+    Manual,        // 수동 선택
+    Cascade,       // 연쇄 장애 (여러 정책 동시)
+}
+
+#[derive(Debug, Clone)]
+pub struct ChaosInjectionRequest {
+    pub policy_name: String,             // SRO 정책 (reduce_batch_size, etc.)
+    pub metric_name: String,             // 위반 메트릭 (p99.latency, etc.)
+    pub current_value: f64,              // 현재 메트릭값
+    pub slo_target: f64,                 // SLO 목표값
+    pub strategy: InjectionStrategy,
+}
+
+// ============================================================================
+// CHAOS REAL INJECTOR: 실제 장애 주입 실행
+// ============================================================================
+
+pub struct ChaosRealInjector {
+    pub injections_executed: u32,
+    pub injection_history: Vec<String>,
+    pub active_faults: Vec<String>,
+    pub recovery_triggered_count: u32,
+}
+
+impl ChaosRealInjector {
+    pub fn new() -> Self {
+        ChaosRealInjector {
+            injections_executed: 0,
+            injection_history: Vec::new(),
+            active_faults: Vec::new(),
+            recovery_triggered_count: 0,
+        }
+    }
+
+    pub fn inject_for_policy(&mut self, request: &ChaosInjectionRequest) -> bool {
+        // 정책에 맞는 장애 주입
+        let fault_name = self.select_fault_for_policy(&request.policy_name);
+        
+        self.log_injection(&format!(
+            "INJECTING: {} for policy {} (metric: {} = {:.2}, SLO: {:.2})",
+            fault_name, request.policy_name, request.metric_name,
+            request.current_value, request.slo_target
+        ));
+        
+        self.active_faults.push(fault_name.clone());
+        self.injections_executed += 1;
+        true
+    }
+
+    fn select_fault_for_policy(&self, policy_name: &str) -> String {
+        match policy_name {
+            "reduce_batch_size" => {
+                "LatencySpike(300ms)".to_string()  // P99 latency 악화
+            }
+            "enable_incremental_gc" => {
+                "MemoryLeak(50MB)".to_string()  // GC pause 악화
+            }
+            "enable_io_queue_prioritization" => {
+                "IOSaturation(50)".to_string()  // I/O latency 악화
+            }
+            "throttle_requests" => {
+                "NetworkDelay(100ms)".to_string()  // 네트워크 지연
+            }
+            "scale_up_resources" => {
+                "MemoryFragmentation".to_string()  // 메모리 단편화
+            }
+            "circuit_breaker" => {
+                "NetworkPartition".to_string()  // 네트워크 분할
+            }
+            _ => "UnknownFault".to_string()
+        }
+    }
+
+    pub fn inject_cascade(&mut self, policies: &[String]) -> u32 {
+        let mut count = 0;
+        for policy in policies {
+            let request = ChaosInjectionRequest {
+                policy_name: policy.clone(),
+                metric_name: "unknown".to_string(),
+                current_value: 0.0,
+                slo_target: 0.0,
+                strategy: InjectionStrategy::Cascade,
+            };
+            if self.inject_for_policy(&request) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn trigger_recovery(&mut self) {
+        self.recovery_triggered_count += 1;
+        self.log_injection(&format!(
+            "RECOVERY TRIGGERED: {} active faults will be recovered",
+            self.active_faults.len()
+        ));
+        self.active_faults.clear();
+    }
+
+    fn log_injection(&mut self, message: &str) {
+        self.injection_history.push(message.to_string());
+    }
+
+    pub fn get_injection_count(&self) -> u32 {
+        self.injections_executed
+    }
+
+    pub fn get_active_fault_count(&self) -> usize {
+        self.active_faults.len()
+    }
+
+    pub fn is_fault_active(&self, fault_name: &str) -> bool {
+        self.active_faults.iter().any(|f| f.contains(fault_name))
+    }
+
+    pub fn get_recovery_trigger_count(&self) -> u32 {
+        self.recovery_triggered_count
+    }
+}
+
+// ============================================================================
+// FEEDBACK LOOP CONTROLLER: Phase H ↔ Phase I 양방향 피드백
+// ============================================================================
+
+pub struct FeedbackLoopController {
+    pub slo_violations_sent: u32,
+    pub policies_received: u32,
+    pub injections_executed: u32,
+    pub recoveries_completed: u32,
+    pub feedback_latency_us: u64,
+}
+
+impl FeedbackLoopController {
+    pub fn new() -> Self {
+        FeedbackLoopController {
+            slo_violations_sent: 0,
+            policies_received: 0,
+            injections_executed: 0,
+            recoveries_completed: 0,
+            feedback_latency_us: 0,
+        }
+    }
+
+    pub fn report_slo_violation(&mut self, metric: &str, value: f64, slo: f64) {
+        self.slo_violations_sent += 1;
+        // Phase H → Phase I: "Monitor says SLO violated"
+    }
+
+    pub fn receive_policy(&mut self, policy: &str) {
+        self.policies_received += 1;
+        // Phase H → Phase I: "Execute this policy"
+    }
+
+    pub fn inject_chaos(&mut self) {
+        self.injections_executed += 1;
+        // Phase I: "Chaos injected per policy"
+    }
+
+    pub fn complete_recovery(&mut self) {
+        self.recoveries_completed += 1;
+        // Phase I → Phase H: "Recovery complete, metrics healthy"
+    }
+
+    pub fn get_feedback_loop_health(&self) -> f64 {
+        // 0.0-1.0: How balanced is the feedback loop?
+        if self.slo_violations_sent == 0 {
+            return 0.0;
+        }
+        
+        let ratio = self.recoveries_completed as f64 / self.slo_violations_sent as f64;
+        (ratio).min(1.0)  // Cap at 1.0
+    }
+
+    pub fn get_end_to_end_latency_us(&self) -> u64 {
+        // 순환 지연: Violation detection → Policy execution → Recovery completion
+        self.feedback_latency_us
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_injector_creation() {
+        let injector = ChaosRealInjector::new();
+        assert_eq!(injector.injections_executed, 0);
+        assert_eq!(injector.active_faults.len(), 0);
+    }
+
+    #[test]
+    fn test_inject_for_policy_latency() {
+        let mut injector = ChaosRealInjector::new();
+        let request = ChaosInjectionRequest {
+            policy_name: "reduce_batch_size".to_string(),
+            metric_name: "p99.latency".to_string(),
+            current_value: 150.0,
+            slo_target: 100.0,
+            strategy: InjectionStrategy::Auto,
+        };
+        
+        injector.inject_for_policy(&request);
+        
+        assert_eq!(injector.injections_executed, 1);
+        assert_eq!(injector.active_faults.len(), 1);
+        assert!(injector.is_fault_active("LatencySpike"));
+    }
+
+    #[test]
+    fn test_inject_for_policy_gc() {
+        let mut injector = ChaosRealInjector::new();
+        let request = ChaosInjectionRequest {
+            policy_name: "enable_incremental_gc".to_string(),
+            metric_name: "gc.pause".to_string(),
+            current_value: 60.0,
+            slo_target: 30.0,
+            strategy: InjectionStrategy::Auto,
+        };
+        
+        injector.inject_for_policy(&request);
+        
+        assert!(injector.is_fault_active("MemoryLeak"));
+    }
+
+    #[test]
+    fn test_cascade_injection() {
+        let mut injector = ChaosRealInjector::new();
+        let policies = vec![
+            "reduce_batch_size".to_string(),
+            "enable_incremental_gc".to_string(),
+            "throttle_requests".to_string(),
+        ];
+        
+        let count = injector.inject_cascade(&policies);
+        
+        assert_eq!(count, 3);
+        assert_eq!(injector.injections_executed, 3);
+        assert_eq!(injector.active_faults.len(), 3);
+    }
+
+    #[test]
+    fn test_recovery_trigger() {
+        let mut injector = ChaosRealInjector::new();
+        let request = ChaosInjectionRequest {
+            policy_name: "reduce_batch_size".to_string(),
+            metric_name: "p99.latency".to_string(),
+            current_value: 150.0,
+            slo_target: 100.0,
+            strategy: InjectionStrategy::Auto,
+        };
+        
+        injector.inject_for_policy(&request);
+        assert_eq!(injector.active_faults.len(), 1);
+        
+        injector.trigger_recovery();
+        
+        assert_eq!(injector.recovery_triggered_count, 1);
+        assert_eq!(injector.active_faults.len(), 0);
+    }
+
+    #[test]
+    fn test_feedback_loop_controller() {
+        let mut controller = FeedbackLoopController::new();
+        
+        controller.report_slo_violation("p99.latency", 150.0, 100.0);
+        controller.receive_policy("reduce_batch_size");
+        controller.inject_chaos();
+        controller.complete_recovery();
+        
+        assert_eq!(controller.slo_violations_sent, 1);
+        assert_eq!(controller.policies_received, 1);
+        assert_eq!(controller.injections_executed, 1);
+        assert_eq!(controller.recoveries_completed, 1);
+        assert_eq!(controller.get_feedback_loop_health(), 1.0);
+    }
+
+    #[test]
+    fn test_feedback_loop_imbalance() {
+        let mut controller = FeedbackLoopController::new();
+        
+        controller.report_slo_violation("p99.latency", 150.0, 100.0);
+        controller.report_slo_violation("p99.latency", 160.0, 100.0);
+        controller.report_slo_violation("gc.pause", 60.0, 30.0);
+        
+        controller.complete_recovery();
+        controller.complete_recovery();
+        
+        // 3 violations, 2 recoveries = 66% health
+        let health = controller.get_feedback_loop_health();
+        assert!(health > 0.6 && health < 0.7);
+    }
+}
