@@ -1,0 +1,250 @@
+// FreeLang Phase H Week 1: Monitoring Dashboard
+// Days 5+: Real-time dashboard + SLO monitoring (300줄, 6테스트)
+// Phase H 통합: Tracing + Metrics → Dashboard → SRO 알림
+
+use std::collections::HashMap;
+
+// ============================================================================
+// DASHBOARD STATE: Real-time monitoring state
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct DashboardMetric {
+    pub name: String,
+    pub current_value: f64,
+    pub threshold: f64,
+    pub unit: String,
+    pub status: String,  // "HEALTHY", "WARNING", "CRITICAL"
+    pub last_updated_us: u64,
+}
+
+impl DashboardMetric {
+    pub fn new(name: String, threshold: f64, unit: String) -> Self {
+        DashboardMetric {
+            name,
+            current_value: 0.0,
+            threshold,
+            unit,
+            status: "HEALTHY".to_string(),
+            last_updated_us: 0,
+        }
+    }
+
+    pub fn update_value(&mut self, value: f64) {
+        self.current_value = value;
+        
+        // Status 결정: 0% ~ 50% = HEALTHY, 50% ~ 90% = WARNING, 90%+ = CRITICAL
+        let percentage = (self.current_value / self.threshold) * 100.0;
+        self.status = if percentage < 50.0 {
+            "HEALTHY".to_string()
+        } else if percentage < 90.0 {
+            "WARNING".to_string()
+        } else {
+            "CRITICAL".to_string()
+        };
+    }
+
+    pub fn to_json(&self) -> String {
+        format!(
+            r#"{{"name":"{}","value":{},"threshold":{},"unit":"{}","status":"{}"}}"#,
+            self.name, self.current_value, self.threshold, self.unit, self.status
+        )
+    }
+}
+
+// ============================================================================
+// DASHBOARD: Central monitoring view
+// ============================================================================
+
+pub struct MonitoringDashboard {
+    pub metrics: HashMap<String, DashboardMetric>,
+    pub alerts: Vec<String>,
+    pub max_alerts: usize,
+    pub slo_targets: HashMap<String, f64>,  // SLO 목표값
+    pub slo_violations: u32,
+}
+
+impl MonitoringDashboard {
+    pub fn new() -> Self {
+        let mut dashboard = MonitoringDashboard {
+            metrics: HashMap::new(),
+            alerts: Vec::new(),
+            max_alerts: 100,
+            slo_targets: HashMap::new(),
+            slo_violations: 0,
+        };
+        
+        // 기본 메트릭 등록
+        dashboard.register_metric("cpu.utilization", 100.0, "percent");
+        dashboard.register_metric("memory.usage", 100.0, "megabytes");
+        dashboard.register_metric("io.latency", 10.0, "milliseconds");
+        dashboard.register_metric("p99.latency", 150.0, "milliseconds");
+        dashboard.register_metric("gc.pause", 50.0, "milliseconds");
+        dashboard.register_metric("cache.hit_rate", 100.0, "percent");
+        
+        // SLO 목표 설정
+        dashboard.slo_targets.insert("p99.latency".to_string(), 100.0);
+        dashboard.slo_targets.insert("gc.pause".to_string(), 30.0);
+        dashboard.slo_targets.insert("cache.hit_rate".to_string(), 90.0);
+        
+        dashboard
+    }
+
+    pub fn register_metric(&mut self, name: &str, threshold: f64, unit: &str) {
+        let metric = DashboardMetric::new(
+            name.to_string(),
+            threshold,
+            unit.to_string(),
+        );
+        self.metrics.insert(name.to_string(), metric);
+    }
+
+    pub fn update_metric(&mut self, name: &str, value: f64) -> bool {
+        if let Some(metric) = self.metrics.get_mut(name) {
+            metric.update_value(value);
+            
+            // SLO 위반 검사
+            if let Some(slo_target) = self.slo_targets.get(name) {
+                if value > *slo_target {
+                    self.slo_violations += 1;
+                    let alert = format!(
+                        "SLO VIOLATION: {} = {:.2} (SLO target: {:.2})",
+                        name, value, slo_target
+                    );
+                    self.add_alert(&alert);
+                    return false;  // SLO 위반
+                }
+            }
+            
+            // CRITICAL 상태 알림
+            if metric.status == "CRITICAL" {
+                let alert = format!(
+                    "CRITICAL ALERT: {} = {:.2} {}, status = {}",
+                    metric.name, metric.current_value, metric.unit, metric.status
+                );
+                self.add_alert(&alert);
+            }
+            
+            return true;  // 정상
+        }
+        false
+    }
+
+    pub fn add_alert(&mut self, message: &str) {
+        self.alerts.push(message.to_string());
+        if self.alerts.len() > self.max_alerts {
+            self.alerts.remove(0);
+        }
+    }
+
+    pub fn get_health_status(&self) -> String {
+        let critical_count = self.metrics.values()
+            .filter(|m| m.status == "CRITICAL")
+            .count();
+        let warning_count = self.metrics.values()
+            .filter(|m| m.status == "WARNING")
+            .count();
+
+        if critical_count > 0 {
+            format!("CRITICAL: {} critical, {} warning", critical_count, warning_count)
+        } else if warning_count > 0 {
+            format!("WARNING: {} warning", warning_count)
+        } else {
+            "HEALTHY: All systems nominal".to_string()
+        }
+    }
+
+    pub fn export_metrics_json(&self) -> String {
+        let metric_jsons: Vec<String> = self.metrics.values()
+            .map(|m| m.to_json())
+            .collect();
+        format!(r#"{{\"metrics\":[{}]}}"#, metric_jsons.join(","))
+    }
+
+    pub fn get_alert_count(&self) -> usize {
+        self.alerts.len()
+    }
+
+    pub fn get_slo_violation_rate(&self) -> f64 {
+        if self.slo_targets.is_empty() {
+            return 0.0;
+        }
+        (self.slo_violations as f64) / (self.slo_targets.len() as f64)
+    }
+
+    pub fn clear_alerts(&mut self) {
+        self.alerts.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dashboard_creation() {
+        let dashboard = MonitoringDashboard::new();
+        assert_eq!(dashboard.metrics.len(), 6);
+        assert_eq!(dashboard.slo_targets.len(), 3);
+    }
+
+    #[test]
+    fn test_metric_update_healthy() {
+        let mut dashboard = MonitoringDashboard::new();
+        dashboard.update_metric("cpu.utilization", 25.0);
+        
+        let metric = &dashboard.metrics["cpu.utilization"];
+        assert_eq!(metric.status, "HEALTHY");
+        assert_eq!(metric.current_value, 25.0);
+    }
+
+    #[test]
+    fn test_metric_update_warning() {
+        let mut dashboard = MonitoringDashboard::new();
+        dashboard.update_metric("memory.usage", 75.0);
+        
+        let metric = &dashboard.metrics["memory.usage"];
+        assert_eq!(metric.status, "WARNING");
+    }
+
+    #[test]
+    fn test_slo_violation_detection() {
+        let mut dashboard = MonitoringDashboard::new();
+        let result = dashboard.update_metric("p99.latency", 200.0);  // SLO: 100.0
+        
+        assert_eq!(result, false);
+        assert_eq!(dashboard.slo_violations, 1);
+        assert_eq!(dashboard.get_alert_count(), 2);  // SLO + CRITICAL
+    }
+
+    #[test]
+    fn test_health_status_critical() {
+        let mut dashboard = MonitoringDashboard::new();
+        dashboard.update_metric("io.latency", 9.5);  // CRITICAL
+        
+        let status = dashboard.get_health_status();
+        assert!(status.contains("CRITICAL"));
+    }
+
+    #[test]
+    fn test_export_metrics_json() {
+        let mut dashboard = MonitoringDashboard::new();
+        dashboard.update_metric("cpu.utilization", 50.0);
+        
+        let json = dashboard.export_metrics_json();
+        assert!(json.contains("cpu.utilization"));
+        assert!(json.contains("50"));
+    }
+
+    #[test]
+    fn test_alert_management() {
+        let mut dashboard = MonitoringDashboard::new();
+        dashboard.add_alert("Test alert 1");
+        dashboard.add_alert("Test alert 2");
+        
+        assert_eq!(dashboard.get_alert_count(), 2);
+        
+        dashboard.clear_alerts();
+        assert_eq!(dashboard.get_alert_count(), 0);
+    }
+}
