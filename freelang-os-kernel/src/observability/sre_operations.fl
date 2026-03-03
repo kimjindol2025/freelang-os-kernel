@@ -1,0 +1,433 @@
+// FreeLang Phase H Week 2: SRE Operations Module
+// Days 8-9: SREDecisionEngine + PolicyExecutor + RecoveryOrchestrator (400줄, 10테스트)
+// Phase H 완성: SLO 위반 → 정책 결정 → 실행 → 복구
+
+use std::collections::HashMap;
+
+// ============================================================================
+// POLICY: SRE 정책 타입
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub enum PolicyType {
+    ReduceBatchSize,           // 배치 크기 감소 (latency 개선)
+    EnableIncrementalGC,       // 증분 GC 활성화 (GC pause 감소)
+    EnableIOQueuePrioritization, // I/O 큐 우선순위화
+    ThrottleRequests,          // 요청 throttling
+    ScaleUpResources,          // 리소스 확장
+    CircuitBreaker,            // Circuit breaker (fail-fast)
+}
+
+impl PolicyType {
+    pub fn to_string(&self) -> String {
+        match self {
+            PolicyType::ReduceBatchSize => "reduce_batch_size".to_string(),
+            PolicyType::EnableIncrementalGC => "enable_incremental_gc".to_string(),
+            PolicyType::EnableIOQueuePrioritization => "enable_io_queue_prioritization".to_string(),
+            PolicyType::ThrottleRequests => "throttle_requests".to_string(),
+            PolicyType::ScaleUpResources => "scale_up_resources".to_string(),
+            PolicyType::CircuitBreaker => "circuit_breaker".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub policy_type: PolicyType,
+    pub severity: u32,                    // 1-5: 낮음~높음
+    pub effectiveness_estimate: f64,      // 0.0~1.0: 예상 효과도
+    pub estimated_improvement_pct: f64,   // 개선도 % (e.g., 30% latency reduction)
+}
+
+// ============================================================================
+// SRE DECISION ENGINE: SLO 위반 → 정책 결정
+// ============================================================================
+
+pub struct SREDecisionEngine {
+    pub slo_targets: HashMap<String, f64>,           // SLO 목표값
+    pub violation_history: Vec<(String, f64, u64)>,  // (메트릭, 위반값, 시간)
+    pub decisions_made: u32,
+    pub successful_policies: u32,
+}
+
+impl SREDecisionEngine {
+    pub fn new() -> Self {
+        let mut engine = SREDecisionEngine {
+            slo_targets: HashMap::new(),
+            violation_history: Vec::new(),
+            decisions_made: 0,
+            successful_policies: 0,
+        };
+        
+        // 기본 SLO 목표값
+        engine.slo_targets.insert("p99.latency".to_string(), 100.0);
+        engine.slo_targets.insert("gc.pause".to_string(), 30.0);
+        engine.slo_targets.insert("cpu.utilization".to_string(), 80.0);
+        engine.slo_targets.insert("memory.usage".to_string(), 85.0);
+        
+        engine
+    }
+
+    pub fn decide_policy(&mut self, metric_name: &str, current_value: f64) -> Option<Policy> {
+        let slo_target = self.slo_targets.get(metric_name)?;
+        
+        // SLO 위반 검사
+        if current_value <= *slo_target {
+            return None;  // SLO 충족
+        }
+        
+        // 위반 기록
+        self.violation_history.push((metric_name.to_string(), current_value, 0));
+        
+        // 메트릭별 정책 결정
+        let policy = match metric_name {
+            "p99.latency" => {
+                let effectiveness = 1.0 - ((current_value - slo_target) / current_value);
+                Policy {
+                    policy_type: PolicyType::ReduceBatchSize,
+                    severity: self.calculate_severity(current_value, *slo_target),
+                    effectiveness_estimate: effectiveness,
+                    estimated_improvement_pct: effectiveness * 30.0,  // 30% latency reduction
+                }
+            }
+            "gc.pause" => {
+                let effectiveness = 1.0 - ((current_value - slo_target) / current_value);
+                Policy {
+                    policy_type: PolicyType::EnableIncrementalGC,
+                    severity: self.calculate_severity(current_value, *slo_target),
+                    effectiveness_estimate: effectiveness,
+                    estimated_improvement_pct: effectiveness * 50.0,  // 50% GC pause reduction
+                }
+            }
+            "cpu.utilization" => {
+                Policy {
+                    policy_type: PolicyType::ThrottleRequests,
+                    severity: self.calculate_severity(current_value, *slo_target),
+                    effectiveness_estimate: 0.7,
+                    estimated_improvement_pct: 25.0,
+                }
+            }
+            "memory.usage" => {
+                Policy {
+                    policy_type: PolicyType::ScaleUpResources,
+                    severity: self.calculate_severity(current_value, *slo_target),
+                    effectiveness_estimate: 0.9,
+                    estimated_improvement_pct: 60.0,
+                }
+            }
+            _ => {
+                Policy {
+                    policy_type: PolicyType::CircuitBreaker,
+                    severity: 1,
+                    effectiveness_estimate: 0.5,
+                    estimated_improvement_pct: 10.0,
+                }
+            }
+        };
+        
+        self.decisions_made += 1;
+        Some(policy)
+    }
+
+    fn calculate_severity(&self, current_value: f64, slo_target: f64) -> u32 {
+        let ratio = current_value / slo_target;
+        if ratio > 2.0 {
+            5  // Critical
+        } else if ratio > 1.5 {
+            4  // High
+        } else if ratio > 1.2 {
+            3  // Medium
+        } else {
+            1  // Low
+        }
+    }
+
+    pub fn get_violation_count(&self) -> usize {
+        self.violation_history.len()
+    }
+
+    pub fn get_most_violated_metric(&self) -> Option<String> {
+        let mut metric_counts = HashMap::new();
+        for (metric, _, _) in &self.violation_history {
+            *metric_counts.entry(metric.clone()).or_insert(0) += 1;
+        }
+        
+        metric_counts.into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(metric, _)| metric)
+    }
+}
+
+// ============================================================================
+// POLICY EXECUTOR: 정책 실행
+// ============================================================================
+
+pub struct PolicyExecutor {
+    pub policies_applied: u32,
+    pub resource_adjustments: HashMap<String, f64>,  // 리소스 변화 추적
+    pub execution_log: Vec<String>,
+}
+
+impl PolicyExecutor {
+    pub fn new() -> Self {
+        PolicyExecutor {
+            policies_applied: 0,
+            resource_adjustments: HashMap::new(),
+            execution_log: Vec::new(),
+        }
+    }
+
+    pub fn execute_policy(&mut self, policy: &Policy) -> bool {
+        match policy.policy_type {
+            PolicyType::ReduceBatchSize => {
+                self.resource_adjustments.insert("batch_size".to_string(), 0.5);  // 50%
+                self.log_execution(&format!(
+                    "EXECUTING: reduce_batch_size (effectiveness: {:.2}%)",
+                    policy.effectiveness_estimate * 100.0
+                ));
+                true
+            }
+            PolicyType::EnableIncrementalGC => {
+                self.resource_adjustments.insert("gc_mode".to_string(), 1.0);
+                self.log_execution(&format!(
+                    "EXECUTING: enable_incremental_gc (pause reduction: {:.1}%)",
+                    policy.estimated_improvement_pct
+                ));
+                true
+            }
+            PolicyType::EnableIOQueuePrioritization => {
+                self.resource_adjustments.insert("io_priority".to_string(), 1.0);
+                self.log_execution("EXECUTING: enable_io_queue_prioritization");
+                true
+            }
+            PolicyType::ThrottleRequests => {
+                self.resource_adjustments.insert("request_rate".to_string(), 0.8);  // 80% 유지
+                self.log_execution("EXECUTING: throttle_requests (rate limit 80%)");
+                true
+            }
+            PolicyType::ScaleUpResources => {
+                self.resource_adjustments.insert("memory_limit".to_string(), 1.5);  // 150%
+                self.log_execution("EXECUTING: scale_up_resources (memory +50%)");
+                true
+            }
+            PolicyType::CircuitBreaker => {
+                self.resource_adjustments.insert("circuit_breaker".to_string(), 1.0);
+                self.log_execution("EXECUTING: circuit_breaker (fail-fast mode)");
+                true
+            }
+        }
+    }
+
+    fn log_execution(&mut self, message: &str) {
+        self.execution_log.push(message.to_string());
+        self.policies_applied += 1;
+    }
+
+    pub fn get_applied_count(&self) -> u32 {
+        self.policies_applied
+    }
+
+    pub fn get_adjustment(&self, resource: &str) -> Option<f64> {
+        self.resource_adjustments.get(resource).copied()
+    }
+}
+
+// ============================================================================
+// RECOVERY ORCHESTRATOR: 자동 복구 오케스트레이션
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub enum RecoveryState {
+    Healthy,
+    Degraded,
+    Recovering,
+    Recovered,
+    Failed,
+}
+
+pub struct RecoveryOrchestrator {
+    pub recovery_state: RecoveryState,
+    pub recovery_start_time_us: u64,
+    pub time_to_recovery_ms: u64,
+    pub validation_results: Vec<bool>,
+    pub rollback_count: u32,
+}
+
+impl RecoveryOrchestrator {
+    pub fn new() -> Self {
+        RecoveryOrchestrator {
+            recovery_state: RecoveryState::Healthy,
+            recovery_start_time_us: 0,
+            time_to_recovery_ms: 0,
+            validation_results: Vec::new(),
+            rollback_count: 0,
+        }
+    }
+
+    pub fn start_recovery(&mut self) {
+        self.recovery_state = RecoveryState::Recovering.clone();
+        self.recovery_start_time_us = 0;
+    }
+
+    pub fn monitor_recovery(&mut self, current_latency: f64, slo_target: f64) {
+        if current_latency <= slo_target {
+            self.recovery_state = RecoveryState::Recovered.clone();
+        } else if current_latency <= slo_target * 1.5 {
+            self.recovery_state = RecoveryState::Degraded.clone();
+        }
+    }
+
+    pub fn validate_recovery(&mut self, metric_value: f64, slo_target: f64) -> bool {
+        let is_healthy = metric_value <= slo_target;
+        self.validation_results.push(is_healthy);
+        is_healthy
+    }
+
+    pub fn get_recovery_success_rate(&self) -> f64 {
+        if self.validation_results.is_empty() {
+            return 0.0;
+        }
+        let successful = self.validation_results.iter().filter(|&&v| v).count();
+        (successful as f64) / (self.validation_results.len() as f64)
+    }
+
+    pub fn is_recovered(&self) -> bool {
+        matches!(self.recovery_state, RecoveryState::Recovered)
+    }
+
+    pub fn mark_rollback(&mut self) {
+        self.rollback_count += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decision_engine_creation() {
+        let engine = SREDecisionEngine::new();
+        assert_eq!(engine.slo_targets.len(), 4);
+        assert_eq!(engine.decisions_made, 0);
+    }
+
+    #[test]
+    fn test_policy_decision_latency_violation() {
+        let mut engine = SREDecisionEngine::new();
+        let policy = engine.decide_policy("p99.latency", 150.0);  // SLO: 100
+        
+        assert!(policy.is_some());
+        let p = policy.unwrap();
+        assert_eq!(engine.decisions_made, 1);
+        assert!(matches!(p.policy_type, PolicyType::ReduceBatchSize));
+    }
+
+    #[test]
+    fn test_policy_decision_no_violation() {
+        let mut engine = SREDecisionEngine::new();
+        let policy = engine.decide_policy("p99.latency", 50.0);  // Within SLO
+        
+        assert!(policy.is_none());
+        assert_eq!(engine.decisions_made, 0);
+    }
+
+    #[test]
+    fn test_severity_calculation() {
+        let mut engine = SREDecisionEngine::new();
+        
+        // Critical: 2.5x SLO
+        let policy1 = engine.decide_policy("p99.latency", 250.0);
+        assert_eq!(policy1.unwrap().severity, 5);
+        
+        // High: 1.8x SLO
+        let policy2 = engine.decide_policy("gc.pause", 54.0);  // SLO: 30
+        assert_eq!(policy2.unwrap().severity, 4);
+    }
+
+    #[test]
+    fn test_policy_executor_execution() {
+        let mut executor = PolicyExecutor::new();
+        let policy = Policy {
+            policy_type: PolicyType::ReduceBatchSize,
+            severity: 3,
+            effectiveness_estimate: 0.8,
+            estimated_improvement_pct: 24.0,
+        };
+        
+        executor.execute_policy(&policy);
+        assert_eq!(executor.get_applied_count(), 1);
+        assert_eq!(executor.get_adjustment("batch_size"), Some(0.5));
+    }
+
+    #[test]
+    fn test_policy_executor_throttle() {
+        let mut executor = PolicyExecutor::new();
+        let policy = Policy {
+            policy_type: PolicyType::ThrottleRequests,
+            severity: 2,
+            effectiveness_estimate: 0.7,
+            estimated_improvement_pct: 25.0,
+        };
+        
+        executor.execute_policy(&policy);
+        assert_eq!(executor.get_adjustment("request_rate"), Some(0.8));
+    }
+
+    #[test]
+    fn test_recovery_orchestrator_state_transition() {
+        let mut orchestrator = RecoveryOrchestrator::new();
+        assert!(matches!(orchestrator.recovery_state, RecoveryState::Healthy));
+        
+        orchestrator.start_recovery();
+        assert!(matches!(orchestrator.recovery_state, RecoveryState::Recovering));
+        
+        orchestrator.monitor_recovery(50.0, 100.0);
+        assert!(matches!(orchestrator.recovery_state, RecoveryState::Recovered));
+    }
+
+    #[test]
+    fn test_recovery_validation() {
+        let mut orchestrator = RecoveryOrchestrator::new();
+        
+        assert!(orchestrator.validate_recovery(50.0, 100.0));
+        assert!(!orchestrator.validate_recovery(150.0, 100.0));
+        assert!(orchestrator.validate_recovery(80.0, 100.0));
+        
+        assert_eq!(orchestrator.get_recovery_success_rate(), 2.0 / 3.0);
+    }
+
+    #[test]
+    fn test_violation_history() {
+        let mut engine = SREDecisionEngine::new();
+        engine.decide_policy("p99.latency", 150.0);
+        engine.decide_policy("p99.latency", 200.0);
+        engine.decide_policy("gc.pause", 60.0);
+        
+        assert_eq!(engine.get_violation_count(), 3);
+        assert_eq!(engine.get_most_violated_metric(), Some("p99.latency".to_string()));
+    }
+
+    #[test]
+    fn test_policy_executor_logging() {
+        let mut executor = PolicyExecutor::new();
+        let policy = Policy {
+            policy_type: PolicyType::EnableIncrementalGC,
+            severity: 3,
+            effectiveness_estimate: 0.75,
+            estimated_improvement_pct: 37.5,
+        };
+        
+        executor.execute_policy(&policy);
+        assert!(!executor.execution_log.is_empty());
+        assert!(executor.execution_log[0].contains("enable_incremental_gc"));
+    }
+
+    #[test]
+    fn test_orchestrator_rollback_tracking() {
+        let mut orchestrator = RecoveryOrchestrator::new();
+        orchestrator.mark_rollback();
+        orchestrator.mark_rollback();
+        
+        assert_eq!(orchestrator.rollback_count, 2);
+    }
+}
