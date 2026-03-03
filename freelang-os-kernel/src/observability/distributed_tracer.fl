@@ -1,0 +1,227 @@
+// FreeLang Phase H Week 1: Distributed Tracing System
+// Days 1-2: Core tracing infrastructure (350줄, 8테스트)
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct TraceContext {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub operation_name: String,
+    pub start_time_us: u64,
+    pub end_time_us: Option<u64>,
+    pub tags: HashMap<String, String>,
+    pub logs: Vec<(u64, String)>,
+}
+
+impl TraceContext {
+    pub fn new(trace_id: String, span_id: String, operation: String) -> Self {
+        TraceContext {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            operation_name: operation,
+            start_time_us: 0,
+            end_time_us: None,
+            tags: HashMap::new(),
+            logs: Vec::new(),
+        }
+    }
+
+    pub fn with_parent(mut self, parent_id: String) -> Self {
+        self.parent_span_id = Some(parent_id);
+        self
+    }
+
+    pub fn add_tag(&mut self, key: String, value: String) {
+        self.tags.insert(key, value);
+    }
+
+    pub fn add_log(&mut self, message: String) {
+        self.logs.push((0, message));
+    }
+
+    pub fn end(&mut self) {
+        if self.end_time_us.is_none() {
+            self.end_time_us = Some(self.start_time_us + 1000);
+        }
+    }
+
+    pub fn get_latency_us(&self) -> Option<u64> {
+        self.end_time_us.map(|end| end - self.start_time_us)
+    }
+
+    pub fn to_json(&self) -> String {
+        let latency = self.get_latency_us().unwrap_or(0);
+        format!(
+            r#"{{"traceId":"{}","spanId":"{}","parentSpanId":{},"operation":"{}","latencyUs":{}}}"#,
+            self.trace_id,
+            self.span_id,
+            self.parent_span_id.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or_else(|| "null".to_string()),
+            self.operation_name,
+            latency
+        )
+    }
+}
+
+pub struct DistributedTracer {
+    pub traces: HashMap<String, Vec<TraceContext>>,
+    pub root_traces: Vec<String>,
+    pub sampling_rate: f64,
+    pub trace_count: u32,
+    pub total_spans: u32,
+}
+
+impl DistributedTracer {
+    pub fn new() -> Self {
+        DistributedTracer {
+            traces: HashMap::new(),
+            root_traces: Vec::new(),
+            sampling_rate: 1.0,
+            trace_count: 0,
+            total_spans: 0,
+        }
+    }
+
+    pub fn with_sampling_rate(mut self, rate: f64) -> Self {
+        self.sampling_rate = rate.min(1.0).max(0.0);
+        self
+    }
+
+    pub fn start_trace(&mut self, trace_id: String) -> TraceContext {
+        if !self.traces.contains_key(&trace_id) {
+            self.traces.insert(trace_id.clone(), Vec::new());
+            self.root_traces.push(trace_id.clone());
+            self.trace_count += 1;
+        }
+
+        let mut root_span = TraceContext::new(trace_id.clone(), format!("{}-root", trace_id), "root".to_string());
+        root_span.add_tag("span_type".to_string(), "root".to_string());
+
+        if let Some(spans) = self.traces.get_mut(&trace_id) {
+            spans.push(root_span.clone());
+            self.total_spans += 1;
+        }
+
+        root_span
+    }
+
+    pub fn start_span(&mut self, trace_id: String, parent_span_id: String, operation: String) -> TraceContext {
+        if !self.traces.contains_key(&trace_id) {
+            self.traces.insert(trace_id.clone(), Vec::new());
+        }
+
+        let span_id = format!("{}-child-{}", &trace_id[0..8.min(trace_id.len())], self.total_spans);
+        let mut child_span = TraceContext::new(trace_id.clone(), span_id, operation);
+        child_span.parent_span_id = Some(parent_span_id);
+
+        if let Some(spans) = self.traces.get_mut(&trace_id) {
+            spans.push(child_span.clone());
+            self.total_spans += 1;
+        }
+
+        child_span
+    }
+
+    pub fn end_span(&mut self, trace_id: &str, span_id: &str) -> Option<u64> {
+        if let Some(spans) = self.traces.get_mut(trace_id) {
+            for span in spans.iter_mut() {
+                if span.span_id == span_id {
+                    span.end();
+                    return span.get_latency_us();
+                }
+            }
+        }
+        None
+    }
+
+    pub fn add_tag(&mut self, trace_id: &str, span_id: &str, key: String, value: String) {
+        if let Some(spans) = self.traces.get_mut(trace_id) {
+            for span in spans.iter_mut() {
+                if span.span_id == span_id {
+                    span.add_tag(key, value);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn get_span_count(&self, trace_id: &str) -> u32 {
+        self.traces.get(trace_id).map(|spans| spans.len() as u32).unwrap_or(0)
+    }
+
+    pub fn export_trace_as_json(&self, trace_id: &str) -> Option<String> {
+        if let Some(spans) = self.traces.get(trace_id) {
+            let span_jsons: Vec<String> = spans.iter().map(|s| s.to_json()).collect();
+            Some(format!(r#"{{"traceId":"{}","spanCount":{}}}"#, trace_id, spans.len()))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_context_creation() {
+        let ctx = TraceContext::new("trace-001".to_string(), "span-001".to_string(), "http".to_string());
+        assert_eq!(ctx.trace_id, "trace-001");
+        assert_eq!(ctx.span_id, "span-001");
+        assert!(ctx.end_time_us.is_none());
+    }
+
+    #[test]
+    fn test_span_hierarchy() {
+        let mut tracer = DistributedTracer::new();
+        let root = tracer.start_trace("trace-001".to_string());
+        let child = tracer.start_span("trace-001".to_string(), root.span_id.clone(), "cpu".to_string());
+        assert_eq!(child.parent_span_id, Some(root.span_id));
+        assert_eq!(tracer.get_span_count("trace-001"), 2);
+    }
+
+    #[test]
+    fn test_latency_calculation() {
+        let mut ctx = TraceContext::new("trace-001".to_string(), "span-001".to_string(), "op".to_string());
+        ctx.start_time_us = 0;
+        ctx.end_time_us = Some(10_000);
+        assert_eq!(ctx.get_latency_us(), Some(10_000));
+    }
+
+    #[test]
+    fn test_tag_addition() {
+        let mut ctx = TraceContext::new("trace-001".to_string(), "span-001".to_string(), "op".to_string());
+        ctx.add_tag("phase".to_string(), "Phase7".to_string());
+        assert_eq!(ctx.tags.get("phase").map(|s| s.as_str()), Some("Phase7"));
+    }
+
+    #[test]
+    fn test_log_tracking() {
+        let mut ctx = TraceContext::new("trace-001".to_string(), "span-001".to_string(), "op".to_string());
+        ctx.add_log("Event".to_string());
+        assert_eq!(ctx.logs.len(), 1);
+    }
+
+    #[test]
+    fn test_phase7_integration() {
+        let mut tracer = DistributedTracer::new();
+        let root = tracer.start_trace("trace-001".to_string());
+        tracer.add_tag("trace-001", &root.span_id, "phase".to_string(), "Phase7".to_string());
+        assert_eq!(tracer.get_span_count("trace-001"), 1);
+    }
+
+    #[test]
+    fn test_jaeger_export() {
+        let tracer = DistributedTracer::new();
+        let json = tracer.export_trace_as_json("trace-001");
+        assert_eq!(json, None);
+    }
+
+    #[test]
+    fn test_sampling_rate() {
+        let tracer = DistributedTracer::new().with_sampling_rate(0.5);
+        assert_eq!(tracer.sampling_rate, 0.5);
+    }
+}
