@@ -3,6 +3,9 @@
 // Week 1 전체 모듈 통합 & 대외 API
 // ============================================================================
 
+// ============================================================================
+// Week 1: Pattern Recognition, Learning State Machine, Pattern Database
+// ============================================================================
 pub mod pattern_recognition;
 pub mod learning_state_machine;
 pub mod pattern_database;
@@ -14,6 +17,29 @@ pub use learning_state_machine::{
 pub use pattern_database::{
     RecoveryHistoryEntry, RecoveryHistoryDB, MetricsSnapshot, PatternStatistics,
     PatternQueryInterface,
+};
+
+// ============================================================================
+// Week 2: Time Series Prediction, Proactive Dispatcher, Self-Learning
+// ============================================================================
+pub mod predictor;
+pub mod proactive_dispatcher;
+pub mod self_learning_predictor;
+
+pub use predictor::{TrendType, TimeSeriesData, PolynomialModel, TrendPredictor, ForecastAccuracy};
+pub use proactive_dispatcher::{ProactiveAction, ScheduledAction, ActionScheduler, ProactiveDispatcher};
+pub use self_learning_predictor::{SelfLearningPredictor, PredictionOutcome};
+
+// ============================================================================
+// Week 3: Node Coordination, Distributed Prediction
+// ============================================================================
+pub mod node_coordination;
+pub mod distributed_prediction;
+
+pub use node_coordination::{NodeInfo, PeerDiscovery, ConsensusLearningEngine};
+pub use distributed_prediction::{
+    NodeForecast, AggregatedForecast, AggregatedForecasting, WeightedVoting,
+    ConflictResolution, DistributedPredictionSystem, VotingDecision,
 };
 
 // ============================================================================
