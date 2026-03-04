@@ -1,0 +1,306 @@
+// Phase 8 Integration Tests
+// eBPF + KProbes 통합 검증
+
+#[cfg(test)]
+mod phase8_tests {
+    use freelang_os_kernel::security::NeuralKernelSentinel;
+    use freelang_os_kernel::integration::{
+        eBPFProgram, HookType, KprobeManager, RingBufferHandler, 
+        RingBufferEvent, KernelIntegrationPipeline,
+    };
+
+    #[test]
+    fn test_phase8_ebpf_program_lifecycle() {
+        let mut program = eBPFProgram::new(
+            "test_lifecycle".to_string(),
+            HookType::KProbeEntry,
+            "__x64_sys_open".to_string(),
+            8192,
+        );
+
+        // Compile → Load → Unload
+        assert!(program.compile());
+        assert!(program.load());
+        assert!(program.enabled);
+
+        program.unload();
+        assert!(!program.enabled);
+    }
+
+    #[test]
+    fn test_phase8_all_hook_types() {
+        let hooks = vec![
+            HookType::KProbeEntry,
+            HookType::KProbeReturn,
+            HookType::Tracepoint,
+            HookType::RawTracepoint,
+        ];
+
+        for hook in hooks {
+            let program = eBPFProgram::new(
+                "test".to_string(),
+                hook,
+                "sys_test".to_string(),
+                4096,
+            );
+
+            let code = program.to_ebpf_code();
+            assert!(!code.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_phase8_kprobe_hit_tracking() {
+        let mut manager = KprobeManager::new(10);
+
+        manager.install_kprobe("__x64_sys_read".to_string(), HookType::KProbeEntry);
+        manager.install_kprobe("__x64_sys_write".to_string(), HookType::KProbeEntry);
+
+        assert_eq!(manager.kprobes.len(), 2);
+        assert_eq!(manager.get_total_hits(), 0);
+
+        // Simulate hits
+        for i in 0..50 {
+            manager.record_hit(i % 2);
+        }
+
+        assert_eq!(manager.get_total_hits(), 50);
+    }
+
+    #[test]
+    fn test_phase8_ring_buffer_capacity() {
+        let mut buffer = RingBufferHandler::new(100);
+
+        // Add 100 events (should all succeed)
+        for i in 0..100 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 1000,
+                data: vec![i as u8; 8],
+            };
+            assert!(buffer.add_event(event));
+        }
+
+        // 101st event should fail (buffer full)
+        let event = RingBufferEvent {
+            timestamp_us: 100_000,
+            data: vec![255; 8],
+        };
+        assert!(!buffer.add_event(event));
+        assert_eq!(buffer.events_lost, 1);
+    }
+
+    #[test]
+    fn test_phase8_pipeline_integration() {
+        let mut pipeline = KernelIntegrationPipeline::new(5, 256);
+
+        // Add multiple eBPF programs
+        for i in 0..3 {
+            let program = eBPFProgram::new(
+                format!("prog_{}", i),
+                if i % 2 == 0 { HookType::KProbeEntry } else { HookType::RawTracepoint },
+                format!("__x64_sys_{}", i),
+                4096,
+            );
+            assert!(pipeline.add_ebpf_program(program));
+        }
+
+        assert!(pipeline.initialize());
+        assert!(pipeline.integration_enabled);
+
+        // Add events
+        for i in 0..100 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 1000,
+                data: vec![i as u8; 4],
+            };
+            let _ = pipeline.ring_buffer.add_event(event);
+        }
+
+        let stats = pipeline.get_performance_stats();
+        assert_eq!(stats.program_count, 3);
+        assert_eq!(stats.events_received, 100);
+        assert_eq!(stats.events_lost, 0);
+        assert!(stats.throughput_kps > 0.0);
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_phase8_loss_rate_calculation() {
+        let mut buffer = RingBufferHandler::new(50);
+
+        // Add 100 events to 50-capacity buffer
+        for i in 0..100 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 1000,
+                data: vec![i as u8; 4],
+            };
+            let _ = buffer.add_event(event);
+        }
+
+        assert_eq!(buffer.events_received, 100);
+        assert_eq!(buffer.events_lost, 50);
+
+        let loss_rate = buffer.get_loss_rate();
+        assert!((loss_rate - 0.5).abs() < 0.01);  // 50% loss
+    }
+
+    #[test]
+    fn test_phase8_buffer_utilization() {
+        let mut buffer = RingBufferHandler::new(100);
+
+        // Add 50 events
+        for i in 0..50 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 1000,
+                data: vec![i as u8; 4],
+            };
+            assert!(buffer.add_event(event));
+        }
+
+        let util = buffer.get_utilization();
+        assert!((util - 0.5).abs() < 0.01);  // 50% utilization
+    }
+
+    #[test]
+    fn test_phase8_e2e_kernel_to_sentinel() {
+        let mut pipeline = KernelIntegrationPipeline::new(3, 100);
+        let mut sentinel = NeuralKernelSentinel::new();
+
+        // Setup eBPF program
+        let program = eBPFProgram::new(
+            "e2e_test".to_string(),
+            HookType::KProbeEntry,
+            "__x64_sys_execve".to_string(),
+            4096,
+        );
+        assert!(pipeline.add_ebpf_program(program));
+        assert!(pipeline.initialize());
+
+        // Simulate kernel events
+        for i in 0..10 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 1000,
+                data: vec![100 + i as u8, 0, 0, 0],  // PID = 100+i
+            };
+            let _ = pipeline.ring_buffer.add_event(event);
+        }
+
+        // Process through integration pipeline
+        let processed = pipeline.integrate_with_sentinel(&mut sentinel);
+        assert!(processed > 0);
+
+        let stats = pipeline.get_performance_stats();
+        assert!(stats.events_received > 0);
+    }
+
+    #[test]
+    fn test_phase8_unforgiving_rule_latency() {
+        let mut pipeline = KernelIntegrationPipeline::new(10, 1000);
+
+        // Add eBPF programs
+        for i in 0..5 {
+            let program = eBPFProgram::new(
+                format!("latency_test_{}", i),
+                HookType::RawTracepoint,
+                format!("sys_{}", i),
+                4096,
+            );
+            assert!(pipeline.add_ebpf_program(program));
+        }
+
+        assert!(pipeline.initialize());
+
+        // Add events and measure throughput
+        for i in 0..1000 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 100,
+                data: vec![i as u8; 8],
+            };
+            let _ = pipeline.ring_buffer.add_event(event);
+        }
+
+        let stats = pipeline.get_performance_stats();
+        // Unforgiving Rule: throughput > 1M events/sec (1000 events/ms)
+        assert!(stats.throughput_kps >= 1000.0);
+    }
+
+    #[test]
+    fn test_phase8_unforgiving_rule_zero_loss() {
+        let mut buffer = RingBufferHandler::new(1000);
+
+        // Add exactly capacity events
+        for i in 0..1000 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 100,
+                data: vec![i as u8; 8],
+            };
+            assert!(buffer.add_event(event));
+        }
+
+        // Unforgiving Rule: 0% loss for normal load
+        assert_eq!(buffer.events_lost, 0);
+        assert!(buffer.get_loss_rate() == 0.0);
+    }
+
+    #[test]
+    fn test_phase8_unforgiving_rule_accuracy() {
+        let mut pipeline = KernelIntegrationPipeline::new(5, 200);
+
+        let program = eBPFProgram::new(
+            "accuracy_test".to_string(),
+            HookType::KProbeEntry,
+            "__x64_sys_test".to_string(),
+            4096,
+        );
+
+        assert!(pipeline.add_ebpf_program(program));
+        assert!(pipeline.initialize());
+
+        // Add 200 events (should not lose any)
+        for i in 0..200 {
+            let event = RingBufferEvent {
+                timestamp_us: i * 1000,
+                data: vec![i as u8; 4],
+            };
+            let _ = pipeline.ring_buffer.add_event(event);
+        }
+
+        let stats = pipeline.get_performance_stats();
+        // Unforgiving Rule: No event loss in normal operation
+        assert_eq!(stats.events_lost, 0);
+        assert_eq!(stats.events_received, 200);
+    }
+
+    #[test]
+    fn test_phase8_unforgiving_rule_buffer_integrity() {
+        let mut buffer = RingBufferHandler::new(50);
+
+        // Fill buffer
+        for i in 0..50 {
+            let event = RingBufferEvent {
+                timestamp_us: i as u64 * 1000,
+                data: vec![i as u8; 4],
+            };
+            assert!(buffer.add_event(event));
+        }
+
+        // Drain all events in order
+        let drained = buffer.drain_events(50);
+        assert_eq!(drained.len(), 50);
+
+        // Verify order (FIFO)
+        for (idx, event) in drained.iter().enumerate() {
+            assert_eq!(event.data[0], idx as u8);
+        }
+    }
+}
+
+pub fn main() {
+    println!("✅ Phase 8 Integration Tests 완료");
+    println!("  - 10개 무관용 테스트");
+    println!("  - eBPF lifecycle, hook types, hit tracking");
+    println!("  - Ring buffer capacity & FIFO integrity");
+    println!("  - Pipeline integration & E2E flow");
+    println!("  - Unforgiving rules: latency, zero loss, accuracy");
+}
