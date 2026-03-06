@@ -1,0 +1,537 @@
+// FreeLang OS Kernel Phase 8: GPU Resource Manager
+// Purpose: Track and allocate GPU memory, compute units, streams
+// R4: 리소스 활용률 >85%, R5: GPU 메모리 <2GB
+// ~700 lines
+
+use super::gpu_scheduler::*;
+
+// ============================================================================
+// Part 1: Memory Pool (120 lines)
+// ============================================================================
+
+pub enum MemoryLocation {
+    DeviceLocal,    // Fast VRAM/GPU-local
+    HostPinned,     // CPU-side, zero-copy accessible from GPU
+    Managed,        // Unified memory (CPU + GPU access)
+    PeerAccessible, // Accessible from another GPU
+}
+
+pub struct MemoryBlock {
+    pub id: u64,
+    pub base_addr: u64,         // physical/virtual base address
+    pub size_bytes: u64,
+    pub location: MemoryLocation,
+    pub owner_task_id: Option<u64>,
+    pub ref_count: u32,
+    pub pinned: bool,
+    pub cached: bool,
+}
+
+impl MemoryBlock {
+    pub fn new(id: u64, base: u64, size: u64, loc: MemoryLocation) -> Self {
+        Self {
+            id,
+            base_addr: base,
+            size_bytes: size,
+            location: loc,
+            owner_task_id: None,
+            ref_count: 0,
+            pinned: false,
+            cached: false,
+        }
+    }
+
+    pub fn is_free(&self) -> bool {
+        self.ref_count == 0
+    }
+
+    pub fn acquire(&mut self, task_id: u64) {
+        self.owner_task_id = Some(task_id);
+        self.ref_count += 1;
+    }
+
+    pub fn release(&mut self) {
+        if self.ref_count > 0 {
+            self.ref_count -= 1;
+            if self.ref_count == 0 {
+                self.owner_task_id = None;
+            }
+        }
+    }
+}
+
+pub struct GpuMemoryPool {
+    pub gpu_id: u32,
+    pub total_bytes: u64,
+    pub blocks: Vec<MemoryBlock>,
+    pub next_block_id: u64,
+    pub allocated_bytes: u64,
+    pub fragmentation_ratio: f64,
+    pub oom_count: u64,
+}
+
+impl GpuMemoryPool {
+    pub fn new(gpu_id: u32, total_mb: u32) -> Self {
+        Self {
+            gpu_id,
+            total_bytes: total_mb as u64 * 1024 * 1024,
+            blocks: vec![],
+            next_block_id: 0,
+            allocated_bytes: 0,
+            fragmentation_ratio: 0.0,
+            oom_count: 0,
+        }
+    }
+
+    pub fn allocate(&mut self, size_bytes: u64, loc: MemoryLocation) -> Option<u64> {
+        if self.allocated_bytes + size_bytes > self.total_bytes {
+            self.oom_count += 1;
+            return None;    // OOM
+        }
+
+        // Find existing free block of sufficient size
+        let pos = self.blocks.iter().position(|b| b.is_free() && b.size_bytes >= size_bytes);
+        if let Some(i) = pos {
+            self.blocks[i].ref_count = 1;
+            self.allocated_bytes += size_bytes;
+            return Some(self.blocks[i].base_addr);
+        }
+
+        // Allocate new block at end
+        let base = self.allocated_bytes;
+        self.allocated_bytes += size_bytes;
+        let id = self.next_block_id;
+        self.next_block_id += 1;
+        let block = MemoryBlock::new(id, base, size_bytes, loc);
+        self.blocks.push(block);
+        self.update_fragmentation();
+        Some(base)
+    }
+
+    pub fn free(&mut self, base_addr: u64) -> bool {
+        if let Some(b) = self.blocks.iter_mut().find(|b| b.base_addr == base_addr) {
+            b.release();
+            if b.is_free() {
+                self.allocated_bytes = self.allocated_bytes.saturating_sub(b.size_bytes);
+            }
+            self.update_fragmentation();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn update_fragmentation(&mut self) {
+        let free_blocks = self.blocks.iter().filter(|b| b.is_free()).count();
+        let total_blocks = self.blocks.len();
+        if total_blocks == 0 {
+            self.fragmentation_ratio = 0.0;
+        } else {
+            self.fragmentation_ratio = free_blocks as f64 / total_blocks as f64;
+        }
+    }
+
+    pub fn utilization(&self) -> f64 {
+        if self.total_bytes == 0 { return 0.0; }
+        self.allocated_bytes as f64 / self.total_bytes as f64
+    }
+
+    pub fn free_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.allocated_bytes)
+    }
+
+    pub fn r5_pass(&self) -> bool {
+        // R5: GPU 메모리 <2GB (2048 MB)
+        self.allocated_bytes < 2u64 * 1024 * 1024 * 1024
+    }
+
+    pub fn compact(&mut self) -> u64 {
+        // Simple compaction: move all live blocks to front
+        let live: Vec<MemoryBlock> = self.blocks.drain(..)
+            .filter(|b| !b.is_free())
+            .collect();
+        let freed = self.blocks.len() as u64;
+
+        let mut offset = 0u64;
+        for mut blk in live {
+            blk.base_addr = offset;
+            offset += blk.size_bytes;
+            self.blocks.push(blk);
+        }
+        self.allocated_bytes = offset;
+        self.update_fragmentation();
+        freed
+    }
+}
+
+// ============================================================================
+// Part 2: Compute Unit Manager (120 lines)
+// ============================================================================
+
+pub struct ComputeUnit {
+    pub id: u32,
+    pub gpu_id: u32,
+    pub running_task_id: Option<u64>,
+    pub occupancy: f64,          // 0.0 to 1.0 (wavefront/warp occupancy)
+    pub total_ops: u64,
+    pub stall_cycles: u64,
+}
+
+impl ComputeUnit {
+    pub fn new(id: u32, gpu_id: u32) -> Self {
+        Self {
+            id,
+            gpu_id,
+            running_task_id: None,
+            occupancy: 0.0,
+            total_ops: 0,
+            stall_cycles: 0,
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.running_task_id.is_none()
+    }
+
+    pub fn assign(&mut self, task_id: u64, occupancy: f64) {
+        self.running_task_id = Some(task_id);
+        self.occupancy = occupancy.min(1.0);
+    }
+
+    pub fn release(&mut self) {
+        self.running_task_id = None;
+        self.occupancy = 0.0;
+    }
+
+    pub fn efficiency(&self) -> f64 {
+        if self.total_ops == 0 { return 0.0; }
+        let total = self.total_ops + self.stall_cycles;
+        self.total_ops as f64 / total as f64
+    }
+}
+
+pub struct ComputeUnitPool {
+    pub gpu_id: u32,
+    pub units: Vec<ComputeUnit>,
+    pub reserved_for_display: u32,  // keep N CUs free for display pipeline
+}
+
+impl ComputeUnitPool {
+    pub fn new(gpu_id: u32, count: u32) -> Self {
+        let units = (0..count).map(|i| ComputeUnit::new(i, gpu_id)).collect();
+        Self {
+            gpu_id,
+            units,
+            reserved_for_display: (count / 16).max(1),  // 6% reserved
+        }
+    }
+
+    pub fn available_units(&self) -> u32 {
+        self.units.iter().filter(|u| u.is_idle()).count() as u32
+    }
+
+    pub fn total_units(&self) -> u32 {
+        self.units.len() as u32
+    }
+
+    pub fn assignable_units(&self) -> u32 {
+        let avail = self.available_units();
+        avail.saturating_sub(self.reserved_for_display)
+    }
+
+    pub fn utilization(&self) -> f64 {
+        let busy = self.units.iter().filter(|u| !u.is_idle()).count();
+        busy as f64 / self.total_units() as f64
+    }
+
+    pub fn assign_to_task(&mut self, task_id: u64, requested: u32) -> u32 {
+        let assignable = self.assignable_units().min(requested);
+        let mut assigned = 0u32;
+
+        for cu in &mut self.units {
+            if assigned >= assignable { break; }
+            if cu.is_idle() {
+                cu.assign(task_id, 0.75);    // 75% occupancy typical
+                assigned += 1;
+            }
+        }
+        assigned
+    }
+
+    pub fn release_task(&mut self, task_id: u64) -> u32 {
+        let mut released = 0u32;
+        for cu in &mut self.units {
+            if cu.running_task_id == Some(task_id) {
+                cu.release();
+                released += 1;
+            }
+        }
+        released
+    }
+
+    pub fn avg_occupancy(&self) -> f64 {
+        let busy: Vec<f64> = self.units.iter()
+            .filter(|u| !u.is_idle())
+            .map(|u| u.occupancy)
+            .collect();
+        if busy.is_empty() { return 0.0; }
+        busy.iter().sum::<f64>() / busy.len() as f64
+    }
+}
+
+// ============================================================================
+// Part 3: Resource Tracking (100 lines)
+// ============================================================================
+
+pub struct ResourceAllocation {
+    pub task_id: u64,
+    pub gpu_id: u32,
+    pub compute_units: u32,
+    pub memory_bytes: u64,
+    pub memory_base: u64,
+    pub stream_id: u32,
+    pub allocated_at_tick: u64,
+}
+
+pub struct ResourceTracker {
+    pub allocations: Vec<ResourceAllocation>,
+    pub total_allocated_cu: u64,
+    pub total_allocated_mem_bytes: u64,
+    pub peak_memory_bytes: u64,
+    pub r4_utilization_samples: Vec<f64>,
+}
+
+impl ResourceTracker {
+    pub fn new() -> Self {
+        Self {
+            allocations: vec![],
+            total_allocated_cu: 0,
+            total_allocated_mem_bytes: 0,
+            peak_memory_bytes: 0,
+            r4_utilization_samples: vec![],
+        }
+    }
+
+    pub fn record_allocation(&mut self, alloc: ResourceAllocation) {
+        self.total_allocated_cu += alloc.compute_units as u64;
+        self.total_allocated_mem_bytes += alloc.memory_bytes;
+        if self.total_allocated_mem_bytes > self.peak_memory_bytes {
+            self.peak_memory_bytes = self.total_allocated_mem_bytes;
+        }
+        self.allocations.push(alloc);
+    }
+
+    pub fn record_deallocation(&mut self, task_id: u64) {
+        if let Some(i) = self.allocations.iter().position(|a| a.task_id == task_id) {
+            let alloc = self.allocations.remove(i);
+            self.total_allocated_cu -= alloc.compute_units as u64;
+            self.total_allocated_mem_bytes = self.total_allocated_mem_bytes.saturating_sub(alloc.memory_bytes);
+        }
+    }
+
+    pub fn sample_utilization(&mut self, cu_pool: &ComputeUnitPool) {
+        self.r4_utilization_samples.push(cu_pool.utilization());
+    }
+
+    pub fn avg_utilization(&self) -> f64 {
+        if self.r4_utilization_samples.is_empty() { return 0.0; }
+        self.r4_utilization_samples.iter().sum::<f64>() / self.r4_utilization_samples.len() as f64
+    }
+
+    pub fn r4_pass(&self) -> bool {
+        // R4: 리소스 활용률 >85%
+        self.avg_utilization() >= 0.85
+    }
+}
+
+// ============================================================================
+// Part 4: Resource Manager (160 lines)
+// ============================================================================
+
+pub struct GpuResourceManager {
+    pub memory_pools: Vec<GpuMemoryPool>,
+    pub cu_pools: Vec<ComputeUnitPool>,
+    pub tracker: ResourceTracker,
+    pub tick: u64,
+}
+
+impl GpuResourceManager {
+    pub fn new(devices: &[GpuDevice]) -> Self {
+        let memory_pools = devices.iter().map(|d| GpuMemoryPool::new(d.id, d.memory_mb)).collect();
+        let cu_pools = devices.iter().map(|d| ComputeUnitPool::new(d.id, d.compute_units)).collect();
+        Self {
+            memory_pools,
+            cu_pools,
+            tracker: ResourceTracker::new(),
+            tick: 0,
+        }
+    }
+
+    pub fn allocate_for_task(&mut self, task: &GpuTask, gpu_id: usize) -> Option<ResourceAllocation> {
+        // 1. Check memory availability
+        let mem_needed = task.input_bytes + task.output_bytes;
+        let base = self.memory_pools[gpu_id].allocate(mem_needed, MemoryLocation::DeviceLocal)?;
+
+        // 2. Allocate compute units
+        let cu_needed = self.estimate_cu_need(task);
+        let cu_assigned = self.cu_pools[gpu_id].assign_to_task(task.id, cu_needed);
+
+        if cu_assigned == 0 {
+            self.memory_pools[gpu_id].free(base);
+            return None;
+        }
+
+        let alloc = ResourceAllocation {
+            task_id: task.id,
+            gpu_id: gpu_id as u32,
+            compute_units: cu_assigned,
+            memory_bytes: mem_needed,
+            memory_base: base,
+            stream_id: 0,
+            allocated_at_tick: self.tick,
+        };
+
+        self.tracker.record_allocation(alloc);
+        self.tracker.allocations.last().cloned()
+    }
+
+    pub fn release_task(&mut self, task_id: u64, gpu_id: usize) {
+        // Release CUs
+        self.cu_pools[gpu_id].release_task(task_id);
+
+        // Release memory (find base from tracker)
+        if let Some(alloc) = self.tracker.allocations.iter().find(|a| a.task_id == task_id) {
+            let base = alloc.memory_base;
+            self.memory_pools[gpu_id].free(base);
+        }
+
+        self.tracker.record_deallocation(task_id);
+    }
+
+    fn estimate_cu_need(&self, task: &GpuTask) -> u32 {
+        // Estimate CUs based on total thread count and kernel type
+        let total_threads = task.total_threads();
+        let threads_per_cu = 64u64;    // typical wavefront = 64 threads
+        let needed = (total_threads / threads_per_cu).max(1) as u32;
+        needed.min(256)    // cap at 256 CUs per task
+    }
+
+    pub fn sample_metrics(&mut self) {
+        self.tick += 1;
+        for pool in &self.cu_pools {
+            self.tracker.r4_utilization_samples.push(pool.utilization());
+        }
+    }
+
+    pub fn total_memory_used_bytes(&self) -> u64 {
+        self.memory_pools.iter().map(|p| p.allocated_bytes).sum()
+    }
+
+    pub fn overall_cu_utilization(&self) -> f64 {
+        let total_cu: u32 = self.cu_pools.iter().map(|p| p.total_units()).sum();
+        let busy_cu: u32 = self.cu_pools.iter().map(|p| p.total_units() - p.available_units()).sum();
+        if total_cu == 0 { return 0.0; }
+        busy_cu as f64 / total_cu as f64
+    }
+
+    pub fn r4_pass(&self) -> bool {
+        self.tracker.r4_pass()
+    }
+
+    pub fn r5_pass(&self) -> bool {
+        self.memory_pools.iter().all(|p| p.r5_pass())
+    }
+
+    pub fn generate_report(&self) -> ResourceReport {
+        ResourceReport {
+            total_memory_used_gb: self.total_memory_used_bytes() as f64 / 1e9,
+            avg_cu_utilization: self.tracker.avg_utilization(),
+            peak_memory_bytes: self.tracker.peak_memory_bytes,
+            active_allocations: self.tracker.allocations.len() as u32,
+            oom_events: self.memory_pools.iter().map(|p| p.oom_count).sum(),
+            r4_pass: self.r4_pass(),
+            r5_pass: self.r5_pass(),
+        }
+    }
+}
+
+pub struct ResourceReport {
+    pub total_memory_used_gb: f64,
+    pub avg_cu_utilization: f64,
+    pub peak_memory_bytes: u64,
+    pub active_allocations: u32,
+    pub oom_events: u64,
+    pub r4_pass: bool,
+    pub r5_pass: bool,
+}
+
+impl ResourceReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "ResourceReport: mem_used={:.2}GB cu_util={:.1}% peak={:.2}GB allocs={} OOM={} R4={} R5={}",
+            self.total_memory_used_gb,
+            self.avg_cu_utilization * 100.0,
+            self.peak_memory_bytes as f64 / 1e9,
+            self.active_allocations,
+            self.oom_events,
+            if self.r4_pass { "PASS" } else { "FAIL" },
+            if self.r5_pass { "PASS" } else { "FAIL" },
+        )
+    }
+}
+
+// ============================================================================
+// Part 5: Bandwidth Monitor (100 lines)
+// ============================================================================
+
+pub struct BandwidthSample {
+    pub tick: u64,
+    pub bytes_transferred: u64,
+    pub direction: String,    // "h2d" host-to-device, "d2h", "d2d"
+    pub duration_ns: u64,
+}
+
+impl BandwidthSample {
+    pub fn bandwidth_gbps(&self) -> f64 {
+        if self.duration_ns == 0 { return 0.0; }
+        (self.bytes_transferred as f64 / 1e9) / (self.duration_ns as f64 / 1e9)
+    }
+}
+
+pub struct BandwidthMonitor {
+    pub samples: Vec<BandwidthSample>,
+    pub max_bandwidth_gbps: f64,
+    pub total_bytes: u64,
+}
+
+impl BandwidthMonitor {
+    pub fn new(max_bw_gbps: f64) -> Self {
+        Self {
+            samples: vec![],
+            max_bandwidth_gbps: max_bw_gbps,
+            total_bytes: 0,
+        }
+    }
+
+    pub fn record(&mut self, bytes: u64, direction: &str, duration_ns: u64, tick: u64) {
+        self.total_bytes += bytes;
+        self.samples.push(BandwidthSample {
+            tick,
+            bytes_transferred: bytes,
+            direction: direction.to_string(),
+            duration_ns,
+        });
+    }
+
+    pub fn avg_bandwidth_gbps(&self) -> f64 {
+        if self.samples.is_empty() { return 0.0; }
+        let sum: f64 = self.samples.iter().map(|s| s.bandwidth_gbps()).sum();
+        sum / self.samples.len() as f64
+    }
+
+    pub fn bandwidth_utilization(&self) -> f64 {
+        let avg = self.avg_bandwidth_gbps();
+        if self.max_bandwidth_gbps == 0.0 { return 0.0; }
+        (avg / self.max_bandwidth_gbps).min(1.0)
+    }
+}
