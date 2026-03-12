@@ -21,6 +21,9 @@ mod demand_paging;
 mod allocator;
 mod context;
 mod scheduler;
+mod io;
+mod keyboard;
+mod disk;
 
 use vga_buffer::WRITER;
 use memory::PhysicalMemoryManager;
@@ -95,9 +98,22 @@ pub extern "C" fn kernel_main(_multiboot_info: u64) -> ! {
         drop(sched);
     }
 
+    // Phase 4: I/O 드라이버 초기화
+    println!("\n🔧 Initializing I/O drivers...");
+    {
+        let kb = keyboard::KEYBOARD.lock();
+        println!("✓ PS/2 Keyboard driver ready");
+        drop(kb);
+    }
+    {
+        let disk = disk::DISK.lock();
+        disk.print_status();
+        drop(disk);
+    }
+
     // 메인 루프
     println!("\n╔════════════════════════════════════════════════════╗");
-    println!("║           🚀 커널 부팅 완료 (Phase 3)              ║");
+    println!("║           🚀 커널 부팅 완료 (Phase 4)              ║");
     println!("╠════════════════════════════════════════════════════╣");
     println!("║ ✓ Multiboot2 부트로더                             ║");
     println!("║ ✓ GDT/IDT 초기화                                  ║");
@@ -105,9 +121,12 @@ pub extern "C" fn kernel_main(_multiboot_info: u64) -> ! {
     println!("║ ✓ Demand Paging 시스템                           ║");
     println!("║ ✓ 힙 할당자 (First-Fit, Best-Fit)               ║");
     println!("║ ✓ Context Switching & Round-Robin 스케줄러       ║");
+    println!("║ ✓ I/O Drivers (PS/2 Keyboard, ATA Disk)         ║");
     println!("╚════════════════════════════════════════════════════╝");
     println!("\n프로세스 타임 슬라이스: 4ms");
-    println!("Context Switching: 타이머 틱마다 활성\n");
+    println!("Context Switching: 타이머 틱마다 활성");
+    println!("Keyboard: 인터럽트 기반 입력 처리");
+    println!("Disk: LBA 기반 섹터 읽기/쓰기\n");
 
     kernel_loop();
 }
@@ -150,6 +169,14 @@ fn kernel_loop() -> ! {
             {
                 let sched = scheduler::SCHEDULER.lock();
                 sched.print_status();
+            }
+            {
+                let kb = keyboard::KEYBOARD.lock();
+                kb.print_status();
+            }
+            {
+                let disk = disk::DISK.lock();
+                disk.print_status();
             }
             println!();
         }

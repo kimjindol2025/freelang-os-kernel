@@ -162,14 +162,8 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-
-    unsafe {
-        let mut port = Port::new(0x60u16);
-        let scancode: u8 = port.read();
-
-        crate::println!("⌨️  Keyboard interrupt: scancode 0x{:x}", scancode);
-    }
+    // Phase 4: 키보드 드라이버 호출
+    crate::keyboard::handle_keyboard_interrupt();
 
     send_eoi(0x21);
 }
