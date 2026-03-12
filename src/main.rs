@@ -19,6 +19,8 @@ mod interrupts;
 mod paging;
 mod demand_paging;
 mod allocator;
+mod context;
+mod scheduler;
 
 use vga_buffer::WRITER;
 use memory::PhysicalMemoryManager;
@@ -82,18 +84,30 @@ pub extern "C" fn kernel_main(_multiboot_info: u64) -> ! {
         alloc.print_status();
     }
 
+    // Phase 3: 프로세스 스케줄러 초기화
+    println!("\n🔧 Initializing process scheduler...");
+    {
+        let mut sched = scheduler::SCHEDULER.lock();
+        // 테스트용 프로세스 생성 (Phase 4에서 실제 프로세스 로드로 대체)
+        sched.add_process(1, 0x400000, 0x7FFF0000);
+        sched.add_process(2, 0x410000, 0x7FFE0000);
+        println!("✓ Process scheduler initialized with 2 test processes");
+        drop(sched);
+    }
+
     // 메인 루프
     println!("\n╔════════════════════════════════════════════════════╗");
-    println!("║           🚀 커널 부팅 완료 (Phase 2)              ║");
+    println!("║           🚀 커널 부팅 완료 (Phase 3)              ║");
     println!("╠════════════════════════════════════════════════════╣");
     println!("║ ✓ Multiboot2 부트로더                             ║");
     println!("║ ✓ GDT/IDT 초기화                                  ║");
     println!("║ ✓ 타이머 & 키보드 인터럽트                        ║");
     println!("║ ✓ Demand Paging 시스템                           ║");
     println!("║ ✓ 힙 할당자 (First-Fit, Best-Fit)               ║");
+    println!("║ ✓ Context Switching & Round-Robin 스케줄러       ║");
     println!("╚════════════════════════════════════════════════════╝");
-    println!("\n타이머 인터럽트: 4ms마다 발생");
-    println!("Demand Paging: 자동 페이지 할당 준비 완료\n");
+    println!("\n프로세스 타임 슬라이스: 4ms");
+    println!("Context Switching: 타이머 틱마다 활성\n");
 
     kernel_loop();
 }
@@ -133,11 +147,18 @@ fn kernel_loop() -> ! {
                 let alloc = allocator::HEAP_ALLOCATOR.lock();
                 alloc.print_status();
             }
+            {
+                let sched = scheduler::SCHEDULER.lock();
+                sched.print_status();
+            }
             println!();
         }
 
-        // 프로세스 스케줄링 (Phase 3에서 구현)
-        // scheduler_tick();
+        // 프로세스 스케줄링 (타이머 틱마다 호출)
+        {
+            let mut sched = scheduler::SCHEDULER.lock();
+            sched.tick();
+        }
 
         // CPU 대기
         unsafe { asm!("hlt"); }
