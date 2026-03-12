@@ -24,6 +24,8 @@ mod scheduler;
 mod io;
 mod keyboard;
 mod disk;
+mod fat32;
+mod vfs;
 
 use vga_buffer::WRITER;
 use memory::PhysicalMemoryManager;
@@ -111,9 +113,17 @@ pub extern "C" fn kernel_main(_multiboot_info: u64) -> ! {
         drop(disk);
     }
 
+    // Phase 5: 파일 시스템 초기화
+    println!("\n🔧 Initializing file system...");
+    {
+        let vfs = vfs::VFS.lock();
+        vfs.print_status();
+        drop(vfs);
+    }
+
     // 메인 루프
     println!("\n╔════════════════════════════════════════════════════╗");
-    println!("║           🚀 커널 부팅 완료 (Phase 4)              ║");
+    println!("║           🚀 커널 부팅 완료 (Phase 5)              ║");
     println!("╠════════════════════════════════════════════════════╣");
     println!("║ ✓ Multiboot2 부트로더                             ║");
     println!("║ ✓ GDT/IDT 초기화                                  ║");
@@ -122,11 +132,13 @@ pub extern "C" fn kernel_main(_multiboot_info: u64) -> ! {
     println!("║ ✓ 힙 할당자 (First-Fit, Best-Fit)               ║");
     println!("║ ✓ Context Switching & Round-Robin 스케줄러       ║");
     println!("║ ✓ I/O Drivers (PS/2 Keyboard, ATA Disk)         ║");
+    println!("║ ✓ FAT32 & 가상 파일 시스템 (VFS)                ║");
     println!("╚════════════════════════════════════════════════════╝");
     println!("\n프로세스 타임 슬라이스: 4ms");
     println!("Context Switching: 타이머 틱마다 활성");
     println!("Keyboard: 인터럽트 기반 입력 처리");
-    println!("Disk: LBA 기반 섹터 읽기/쓰기\n");
+    println!("Disk: LBA 기반 섹터 읽기/쓰기");
+    println!("File System: FAT32 및 Inode 기반 메타데이터\n");
 
     kernel_loop();
 }
@@ -177,6 +189,10 @@ fn kernel_loop() -> ! {
             {
                 let disk = disk::DISK.lock();
                 disk.print_status();
+            }
+            {
+                let vfs = vfs::VFS.lock();
+                vfs.print_status();
             }
             println!();
         }
