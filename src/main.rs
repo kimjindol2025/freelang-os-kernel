@@ -4,6 +4,9 @@
 #![no_std]
 #![no_main]
 #![feature(asm_const)]
+#![feature(allocator_api)]
+
+extern crate alloc;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -13,6 +16,9 @@ mod vga_buffer;
 mod memory;
 mod gdt;
 mod interrupts;
+mod paging;
+mod demand_paging;
+mod allocator;
 
 use vga_buffer::WRITER;
 use memory::PhysicalMemoryManager;
@@ -50,14 +56,44 @@ pub extern "C" fn kernel_main(_multiboot_info: u64) -> ! {
     let _phys_mem = unsafe { PhysicalMemoryManager::new(0x1000) };
     println!("✓ Physical memory manager initialized");
 
+    // Phase 2: Demand Paging 초기화
+    println!("\n🔧 Initializing demand paging system...");
+    let demand_paging_mgr = demand_paging::DEMAND_PAGING.lock();
+    println!("✓ Demand paging manager ready");
+    drop(demand_paging_mgr);
+
+    // 힙 할당자 초기화
+    println!("🔧 Initializing heap allocator...");
+    {
+        let alloc = allocator::HEAP_ALLOCATOR.lock();
+        println!("✓ Heap allocator initialized");
+        println!("  Heap range: 0x200000 ~ 0x20000000 (510 MB)");
+        drop(alloc);
+    }
+
     // 인터럽트 활성화
     unsafe { asm!("sti"); }
     println!("✓ Interrupts enabled");
 
+    // 메모리 상태 출력
+    println!("\n📊 System Memory Status:");
+    {
+        let alloc = allocator::HEAP_ALLOCATOR.lock();
+        alloc.print_status();
+    }
+
     // 메인 루프
-    println!("\n=== 커널 부팅 완료 ===");
-    println!("타이머 인터럽트: 4ms마다 발생");
-    println!("프로세스 관리: 준비 중");
+    println!("\n╔════════════════════════════════════════════════════╗");
+    println!("║           🚀 커널 부팅 완료 (Phase 2)              ║");
+    println!("╠════════════════════════════════════════════════════╣");
+    println!("║ ✓ Multiboot2 부트로더                             ║");
+    println!("║ ✓ GDT/IDT 초기화                                  ║");
+    println!("║ ✓ 타이머 & 키보드 인터럽트                        ║");
+    println!("║ ✓ Demand Paging 시스템                           ║");
+    println!("║ ✓ 힙 할당자 (First-Fit, Best-Fit)               ║");
+    println!("╚════════════════════════════════════════════════════╝");
+    println!("\n타이머 인터럽트: 4ms마다 발생");
+    println!("Demand Paging: 자동 페이지 할당 준비 완료\n");
 
     kernel_loop();
 }
@@ -69,13 +105,38 @@ fn kernel_loop() -> ! {
     loop {
         tick_count += 1;
 
-        // 1초마다 메시지 출력 (timer_ticks = 250 = 1000ms)
+        // 1초마다 상태 출력 (timer_ticks = 250 = 1000ms)
         if tick_count % 250 == 0 {
             let seconds = tick_count / 250;
-            println!("⏱️  Uptime: {}s", seconds);
+            println!("\n⏱️  Uptime: {}s", seconds);
+
+            // 메모리 상태 출력
+            {
+                let alloc = allocator::HEAP_ALLOCATOR.lock();
+                let available = alloc.available_memory();
+                let frag = alloc.fragmentation_ratio();
+                println!("  📊 Heap: {} KB free, {:.1}% fragmentation",
+                    available / 1024, frag * 100.0);
+            }
+
+            // Demand Paging 상태
+            {
+                let dp = demand_paging::DEMAND_PAGING.lock();
+                dp.print_status();
+            }
         }
 
-        // 프로세스 스케줄링 (여기서 context switching 발생)
+        // 5초마다 상세 정보 출력
+        if tick_count % 1250 == 0 && tick_count > 0 {
+            println!("\n📋 Detailed System Status:");
+            {
+                let alloc = allocator::HEAP_ALLOCATOR.lock();
+                alloc.print_status();
+            }
+            println!();
+        }
+
+        // 프로세스 스케줄링 (Phase 3에서 구현)
         // scheduler_tick();
 
         // CPU 대기

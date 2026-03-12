@@ -104,13 +104,17 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     let virtual_addr = Cr2::read();
 
-    crate::println!("📄 EXCEPTION: Page Fault");
-    crate::println!("   Address: 0x{:x}", virtual_addr);
+    crate::println!("📄 PAGE FAULT");
+    crate::println!("   Virtual Address: 0x{:x}", virtual_addr);
     crate::println!("   Error Code: {:?}", error_code);
-    crate::println!("   Instruction: 0x{:x}", stack_frame.instruction_pointer);
+    crate::println!("   RIP: 0x{:x}", stack_frame.instruction_pointer);
 
-    // 현재는 그냥 에러만 출력
-    // Phase 6에서 Demand Paging 구현
+    // Phase 2: Demand Paging 구현
+    // TODO: 실제 페이지 할당 및 페이지 테이블 업데이트
+
+    // 현재는 커널 패닉
+    crate::println!("\n❌ Demand paging not yet implemented");
+    crate::println!("   Phase 2에서 구현 예정");
 
     loop {
         unsafe { asm!("hlt"); }
